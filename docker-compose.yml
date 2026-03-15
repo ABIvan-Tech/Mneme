@@ -1,0 +1,10 @@
+services:
+  self-memory-mcp:
+    build: .
+    volumes:
+      - ./data:/app/data
+    environment:
+      - SQLITE_PATH=/app/data/self-memory.db
+      - LOG_LEVEL=info
+      - EMBEDDING_PROVIDER=local
+    restart: unless-stopped

@@ -1,0 +1,21 @@
+node_modules/
+dist/
+.env
+*.log
+.github/
+.vscode/
+
+# Database files
+data/*.json
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+!data/.gitkeep
+
+# Backup files — local only, may contain personal memory data
+data/*.json
+
+# Model cache downloaded by Xenova
+.cache/
+*.onnx
+
