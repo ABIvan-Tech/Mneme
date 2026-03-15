@@ -1,6 +1,6 @@
 # Mneme
 
-`Mnemo Self MCP` is an MCP server for preserving the continuity of an LLM's identity.
+`Mneme` is an MCP server for preserving the continuity of an LLM's identity.
 
 Documentation set:
 
@@ -99,11 +99,7 @@ Use `canonical_key` for stable identity facts that should be updated in place in
 - `core.values.truth`
 - `boundary.directness`
 - `ritual.session-opening`
-- `core_voice`
-- `core_values_truth`
-- `boundary_directness`
-- `ritual_session-opening`
-- `relationship_trust-style`
+- `relationship.trust-style`
 
 If a new memory is written with the same `canonical_key`, the plugin updates the existing active memory instead of creating a duplicate.
 
@@ -191,7 +187,7 @@ For direct writes:
 ### Using npx
 
 ```bash
-npx @modelcontextprotocol/server-mnemo-self [options]
+npx @abivan-tech/mneme [options]
 ```
 
 ### Local Development
@@ -287,11 +283,11 @@ Default database path:
 ```json
 {
   "mcpServers": {
-    "mnemo-self": {
+    "mneme": {
       "command": "node",
-      "args": ["/absolute/path/to/Mnemo/dist/index.js"],
+      "args": ["/absolute/path/to/Mneme/dist/index.js"],
       "env": {
-        "SQLITE_PATH": "/absolute/path/to/Mnemo/data/self-memory.db",
+        "SQLITE_PATH": "/absolute/path/to/Mneme/data/self-memory.db",
         "LOG_LEVEL": "info",
         "SELF_SNAPSHOT_LIMIT": "12"
       }

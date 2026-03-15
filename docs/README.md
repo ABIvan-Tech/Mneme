@@ -1,6 +1,6 @@
 # Project Overview
 
-`Mnemo Self MCP` is a local-first MCP server for preserving the continuity of an LLM's identity.
+`Mneme` is a local-first MCP server for preserving the continuity of an LLM's identity.
 
 The project exists to solve one problem:
 
