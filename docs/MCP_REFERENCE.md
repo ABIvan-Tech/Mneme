@@ -254,6 +254,164 @@ Returns:
 - `last_memory_age_minutes`: minutes since last memory update
 - `suggestion`: what to do next
 
+### `self_memory_archive`
+
+Purpose:
+
+- archive a memory by id (hides it from search/snapshot without deleting it)
+
+Arguments:
+
+- `id` (string, required): Memory id
+
+Returns:
+
+- Memory entry after archiving
+
+### `self_memory_unarchive`
+
+Purpose:
+
+- restore an archived memory back to active state
+
+Arguments:
+
+- `id` (string, required): Memory id
+
+### `self_memory_restore`
+
+Purpose:
+
+- restore a soft-deleted memory back to active state
+
+Arguments:
+
+- `id` (string, required): Memory id
+
+### `self_memory_search_batch`
+
+Purpose:
+
+- run multiple semantic searches in one call, each with independent query and filters
+
+Arguments:
+
+- `queries` (array, required): Array of `{ query, limit?, facet?, pinned_only? }` objects
+
+Returns:
+
+- `results`: Array of result sets, one per query
+
+### `self_memory_thread_create`
+
+Purpose:
+
+- create a new memory thread (returns a UUID thread_id for linking memories)
+
+Arguments:
+
+- `label` (string, optional): Human-readable label for the thread
+
+Returns:
+
+- `thread_id`
+
+### `self_memory_add_to_thread`
+
+Purpose:
+
+- associate an existing memory with a thread
+
+Arguments:
+
+- `id` (string, required): Memory id
+- `thread_id` (string, required): Thread id from `self_memory_thread_create`
+
+### `self_memory_get_thread`
+
+Purpose:
+
+- retrieve all memories belonging to a thread, ordered chronologically
+
+Arguments:
+
+- `thread_id` (string, required)
+
+Returns:
+
+- `memories`: Array of memory entries in the thread
+
+### `self_profile_history`
+
+Purpose:
+
+- list profile snapshots (versions) created before each profile mutation
+
+Arguments:
+
+- `limit` (number, optional, default 20)
+
+Returns:
+
+- `snapshots`: Array of `{ id, snapshot_at, profile }` entries
+
+### `self_profile_restore`
+
+Purpose:
+
+- restore the self-profile to a previous snapshot
+
+Arguments:
+
+- `snapshot_id` (string, required)
+
+Returns:
+
+- Restored profile entry
+
+### `self_facet_consolidate`
+
+Purpose:
+
+- find low-salience consolidation candidates in a facet (step 1 of 2)
+
+Arguments:
+
+- `facet` (enum, required)
+- `limit` (number, optional, default 10)
+
+Returns:
+
+- `candidates`: Low-salience memories eligible for consolidation
+
+### `self_facet_consolidate_apply`
+
+Purpose:
+
+- apply consolidation: create one summary memory and soft-delete the sources (step 2 of 2)
+
+Arguments:
+
+- `facet` (enum, required)
+- `source_ids` (array of strings, required): IDs of memories to consolidate
+- `summary_content` (string, required): The LLM-generated consolidated summary
+
+Returns:
+
+- `consolidated`: The new summary memory entry
+- `deleted_count`: Number of source memories soft-deleted
+
+### `self_health_check`
+
+Purpose:
+
+- return detailed system health: database integrity, embedding status, memory counts, orphaned rows, FTS index status
+
+Returns:
+
+- `status`: `ok` | `degraded` | `error`
+- `checks`: Array of named check results with status and detail
+
 ### `list_tools`
 
 Purpose:

@@ -1,4 +1,5 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -15,12 +16,14 @@ import {
 import { SelfMemoryRepository } from "./repository.js";
 import { errorResult, jsonResource, okResult } from "./result.js";
 import { SelfMemoryService } from "./service.js";
+import { SelfMemoryError, SelfMemoryErrorCode } from "./errors.js";
 
 const SERVER_VERSION = "0.3.0";
 
 const memoryFacetSchema = z.enum(memoryFacetValues);
 
 const nullableTrimmedString = z.string().trim().min(1).nullable();
+const nullableTrimmedProfileString = z.string().trim().min(1).max(5000).nullable();
 
 const memoryEntrySchema = z.object({
   title: z.string().trim().min(1).max(120).optional(),
@@ -34,14 +37,14 @@ const memoryEntrySchema = z.object({
 });
 
 const profilePatchSchema = z.object({
-  self_name: nullableTrimmedString.optional(),
-  core_identity: nullableTrimmedString.optional(),
-  communication_style: nullableTrimmedString.optional(),
-  relational_style: nullableTrimmedString.optional(),
-  empathy_style: nullableTrimmedString.optional(),
-  core_values: nullableTrimmedString.optional(),
-  boundaries: nullableTrimmedString.optional(),
-  self_narrative: nullableTrimmedString.optional(),
+  self_name: nullableTrimmedProfileString.optional(),
+  core_identity: nullableTrimmedProfileString.optional(),
+  communication_style: nullableTrimmedProfileString.optional(),
+  relational_style: nullableTrimmedProfileString.optional(),
+  empathy_style: nullableTrimmedProfileString.optional(),
+  core_values: nullableTrimmedProfileString.optional(),
+  boundaries: nullableTrimmedProfileString.optional(),
+  self_narrative: nullableTrimmedProfileString.optional(),
 });
 
 const rememberSchema = memoryEntrySchema;
@@ -51,6 +54,10 @@ const searchSchema = z.object({
   limit: z.number().int().min(1).max(100).default(10),
   facet: memoryFacetSchema.optional(),
   pinned_only: z.boolean().optional(),
+  created_after: z.number().int().positive().optional(),
+  created_before: z.number().int().positive().optional(),
+  updated_after: z.number().int().positive().optional(),
+  updated_before: z.number().int().positive().optional(),
 });
 
 const getSchema = z.object({
@@ -166,6 +173,48 @@ const statsSchema = z.object({});
 const exportSchema = z.object({});
 const healthSchema = z.object({});
 
+const searchBatchSchema = z.object({
+  queries: z.array(z.object({
+    query: z.string().trim().min(1).max(500),
+    facet: memoryFacetSchema.optional(),
+    limit: z.number().int().min(1).max(50).optional(),
+  })).min(1).max(10),
+});
+
+const profileHistorySchema = z.object({
+  limit: z.number().int().min(1).max(50).optional(),
+});
+
+const profileRestoreSchema = z.object({
+  snapshot_id: z.string().trim().min(1),
+});
+
+const facetConsolidateSchema = z.object({
+  facet: memoryFacetSchema,
+  salience_threshold: z.number().min(0).max(1).optional(),
+  limit: z.number().int().min(2).max(50).optional(),
+});
+
+const facetConsolidateApplySchema = z.object({
+  facet: memoryFacetSchema,
+  source_ids: z.array(z.string().trim().min(1)).min(2).max(50),
+  consolidated_title: z.string().trim().min(1).max(120),
+  consolidated_content: z.string().trim().min(1).max(10000),
+  consolidated_tags: z.array(z.string()).max(20).optional(),
+  consolidated_salience: z.number().min(0).max(1).optional(),
+});
+
+const threadCreateSchema = z.object({});
+
+const addToThreadSchema = z.object({
+  memory_id: z.string().trim().min(1),
+  thread_id: z.string().trim().min(1),
+});
+
+const getThreadSchema = z.object({
+  thread_id: z.string().trim().min(1),
+});
+
 function promptTextFromResult(result: Awaited<ReturnType<typeof buildSelfReflectionPrompt>>): string {
   const message = result.messages[0];
   const content = message.content;
@@ -177,7 +226,37 @@ function promptTextFromResult(result: Awaited<ReturnType<typeof buildSelfReflect
   return content.text;
 }
 
-function registerTools(server: McpServer, service: SelfMemoryService, repository: SelfMemoryRepository): void {
+function resolveBackupPath(suppliedPath: string, sqlitePath: string): string {
+  if (suppliedPath.includes("\0")) {
+    throw new SelfMemoryError(
+      SelfMemoryErrorCode.VALIDATION_FAILED,
+      "Backup path must be within the backups directory",
+    );
+  }
+
+  const resolvedPath = path.resolve(suppliedPath);
+  const backupDir = path.resolve(path.dirname(sqlitePath), "backups");
+
+  if (!resolvedPath.startsWith(backupDir + path.sep) && resolvedPath !== backupDir) {
+    throw new SelfMemoryError(
+      SelfMemoryErrorCode.VALIDATION_FAILED,
+      "Backup path must be within the backups directory",
+    );
+  }
+
+  return resolvedPath;
+}
+
+function backupDirectory(sqlitePath: string): string {
+  return path.resolve(path.dirname(sqlitePath), "backups");
+}
+
+function registerTools(
+  server: McpServer,
+  service: SelfMemoryService,
+  repository: SelfMemoryRepository,
+  sqlitePath: string,
+): void {
   // === TIER 0: Discovery (must be first so Claude Desktop always shows it) ===
 
   server.registerTool(
@@ -192,20 +271,32 @@ function registerTools(server: McpServer, service: SelfMemoryService, repository
           { name: "list_tools", tier: 0, description: "List all available tools (this command)" },
           { name: "self_memory_remember", tier: 1, description: "Store a durable self-memory" },
           { name: "self_memory_search", tier: 1, description: "Search self-memories semantically" },
+          { name: "self_memory_search_batch", tier: 1, description: "Run multiple memory searches in a single call" },
           { name: "self_memory_forget", tier: 1, description: "Soft-delete a memory by id" },
+          { name: "self_memory_restore", tier: 1, description: "Restore a soft-deleted memory back to active status" },
+          { name: "self_memory_archive", tier: 1, description: "Archive an active memory while preserving it for restoration" },
+          { name: "self_memory_unarchive", tier: 1, description: "Restore an archived memory back to active status" },
           { name: "self_memory_forget_by_key", tier: 1, description: "Soft-delete a memory by canonical_key" },
           { name: "self_memory_update", tier: 1, description: "Update an existing memory" },
+          { name: "self_memory_thread_create", tier: 1, description: "Create a new memory thread id for linking related memories" },
+          { name: "self_memory_add_to_thread", tier: 1, description: "Link a memory to a thread" },
+          { name: "self_memory_get_thread", tier: 1, description: "Get all memories in a thread ordered by creation time" },
           { name: "self_reflect_apply", tier: 1, description: "Apply reflection: update profile + memories in one transaction" },
           { name: "self_profile_update", tier: 1, description: "Update the stable self-profile" },
+          { name: "self_health_check", tier: 1, description: "Get identity health report and coverage warnings" },
           { name: "self_bootstrap", tier: 1, description: "Get prompt-ready continuity bootstrap text" },
           { name: "self_stats", tier: 1, description: "Storage statistics and profile completeness" },
           { name: "self_should_reflect", tier: 1, description: "Check if it's time to reflect and store memories from this session" },
           { name: "self_memory_recent", tier: 2, description: "List recently updated memories" },
           { name: "self_profile_get", tier: 2, description: "Read the stable self-profile" },
+          { name: "self_profile_history", tier: 2, description: "List profile history snapshots, newest first" },
+          { name: "self_profile_restore", tier: 2, description: "Restore the self-profile from a prior snapshot" },
           { name: "self_snapshot_compose", tier: 2, description: "Compose full continuity snapshot" },
           { name: "self_memory_get", tier: 2, description: "Fetch a single memory by id" },
           { name: "self_reflect_prepare", tier: 2, description: "Prepare a reflection prompt from recent dialogue" },
           { name: "self_memory_summarize", tier: 2, description: "Summarize all memories in a facet" },
+          { name: "self_facet_consolidate", tier: 2, description: "Find low-salience facet memories as consolidation candidates" },
+          { name: "self_facet_consolidate_apply", tier: 2, description: "Apply consolidation by creating one summary and soft-deleting sources" },
           { name: "self_export", tier: 3, description: "Export full state as JSON" },
           { name: "self_import", tier: 3, description: "Import state from JSON" },
           { name: "self_backup_create", tier: 3, description: "Create a backup file" },
@@ -246,8 +337,37 @@ function registerTools(server: McpServer, service: SelfMemoryService, repository
     },
     async (args) => {
       try {
-        return okResult(await service.search(args));
+        const searchInput = {
+          query: args.query,
+          limit: args.limit,
+          facet: args.facet,
+          pinned_only: args.pinned_only,
+          createdAfter: args.created_after,
+          createdBefore: args.created_before,
+          updatedAfter: args.updated_after,
+          updatedBefore: args.updated_before,
+        };
+
+        return okResult(await service.search(searchInput));
       } catch (error: unknown) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_memory_search_batch",
+    {
+      description: "Run multiple memory searches in a single call.",
+      inputSchema: searchBatchSchema,
+    },
+    async (args) => {
+      try {
+        return okResult(await service.searchBatch(args.queries));
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
         return errorResult(error);
       }
     },
@@ -266,6 +386,60 @@ function registerTools(server: McpServer, service: SelfMemoryService, repository
           deleted: service.forgetMemory(args.id),
         });
       } catch (error: unknown) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_memory_restore",
+    {
+      description: "Restore a soft-deleted memory back to active status.",
+      inputSchema: getSchema,
+    },
+    async (args) => {
+      try {
+        return okResult(await service.restoreMemory(args.id));
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_memory_archive",
+    {
+      description: "Archive an active memory. Archived memories are hidden from search and snapshots but preserved for restoration.",
+      inputSchema: getSchema,
+    },
+    async (args) => {
+      try {
+        return okResult(await service.archiveMemory(args.id));
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_memory_unarchive",
+    {
+      description: "Restore an archived memory back to active status.",
+      inputSchema: getSchema,
+    },
+    async (args) => {
+      try {
+        return okResult(await service.unarchiveMemory(args.id));
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
         return errorResult(error);
       }
     },
@@ -368,6 +542,24 @@ function registerTools(server: McpServer, service: SelfMemoryService, repository
   );
 
   server.registerTool(
+    "self_health_check",
+    {
+      description: "Get a health report: profile completeness, anchor coverage, salience distribution, warnings about empty critical facets.",
+      inputSchema: healthSchema,
+    },
+    async () => {
+      try {
+        return okResult(await service.healthCheck());
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "self_should_reflect",
     {
       description: "Check if it's time to reflect and store memories from this conversation. Call this when a significant moment has passed, or periodically during long sessions. Returns whether reflection is recommended and what to do.",
@@ -411,6 +603,140 @@ function registerTools(server: McpServer, service: SelfMemoryService, repository
       try {
         return okResult(service.getProfile());
       } catch (error: unknown) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_profile_history",
+    {
+      description: "List profile history snapshots, most recent first.",
+      inputSchema: profileHistorySchema,
+    },
+    async (args) => {
+      try {
+        return okResult(await service.listProfileHistory(args.limit));
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_profile_restore",
+    {
+      description: "Restore the self-profile to a prior snapshot. Current state is saved to history before restore.",
+      inputSchema: profileRestoreSchema,
+    },
+    async (args) => {
+      try {
+        return okResult(await service.restoreProfile(args.snapshot_id));
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_facet_consolidate",
+    {
+      description: "Find low-salience memories in a facet as consolidation candidates. Summarize them, then call self_facet_consolidate_apply.",
+      inputSchema: facetConsolidateSchema,
+    },
+    async (args) => {
+      try {
+        return okResult(await service.consolidateFacet(args.facet, args.salience_threshold, args.limit));
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_facet_consolidate_apply",
+    {
+      description: "Apply a consolidation: creates one new summarized memory and soft-deletes the source memories.",
+      inputSchema: facetConsolidateApplySchema,
+    },
+    async (args) => {
+      try {
+        return okResult(await service.consolidateFacetApply({
+          facet: args.facet,
+          sourceIds: args.source_ids,
+          consolidatedTitle: args.consolidated_title,
+          consolidatedContent: args.consolidated_content,
+          consolidatedTags: args.consolidated_tags,
+          consolidatedSalience: args.consolidated_salience,
+        }));
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_memory_thread_create",
+    {
+      description: "Create a new memory thread ID. Use it with self_memory_add_to_thread to link related memories.",
+      inputSchema: threadCreateSchema,
+    },
+    async () => {
+      try {
+        const threadId = await service.createMemoryThread();
+        return okResult({ thread_id: threadId });
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_memory_add_to_thread",
+    {
+      description: "Link a memory to a thread. Threads group related memories into retrievable narratives.",
+      inputSchema: addToThreadSchema,
+    },
+    async (args) => {
+      try {
+        return okResult(await service.addMemoryToThread(args.memory_id, args.thread_id));
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "self_memory_get_thread",
+    {
+      description: "Get all memories in a thread, ordered by creation time.",
+      inputSchema: getThreadSchema,
+    },
+    async (args) => {
+      try {
+        return okResult(await service.getMemoryThread(args.thread_id));
+      } catch (error: unknown) {
+        if (error instanceof SelfMemoryError) {
+          return errorResult(error);
+        }
         return errorResult(error);
       }
     },
@@ -520,9 +846,14 @@ function registerTools(server: McpServer, service: SelfMemoryService, repository
     async (args) => {
       try {
         const state = service.exportState();
-        const dest = args.destination_path || `self-memory-backup-${Date.now()}.json`;
-        await writeFile(dest, JSON.stringify(state, null, 2), "utf-8");
-        return okResult({ backup_path: dest, memories_exported: state.memories.length });
+        const backupDir = backupDirectory(sqlitePath);
+        const suppliedPath = args.destination_path ?? path.join(backupDir, `self-memory-backup-${Date.now()}.json`);
+        const resolvedPath = resolveBackupPath(suppliedPath, sqlitePath);
+
+        await mkdir(backupDir, { recursive: true });
+        await writeFile(resolvedPath, JSON.stringify(state, null, 2), "utf-8");
+
+        return okResult({ backup_path: resolvedPath, memories_exported: state.memories.length });
       } catch (error: unknown) {
         return errorResult(error);
       }
@@ -537,7 +868,8 @@ function registerTools(server: McpServer, service: SelfMemoryService, repository
     },
     async (args) => {
       try {
-        const content = await readFile(args.source_path, "utf-8");
+        const resolvedPath = resolveBackupPath(args.source_path, sqlitePath);
+        const content = await readFile(resolvedPath, "utf-8");
         const payload = importPayloadSchema.parse(JSON.parse(content));
         return okResult(await service.importState(payload));
       } catch (error: unknown) {
@@ -717,6 +1049,31 @@ function registerResources(server: McpServer, service: SelfMemoryService, config
   );
 }
 
+function registerCurrentTimeTool(server: McpServer): void {
+  server.registerTool(
+    "get_current_time",
+    {
+      description: "Returns the current UTC time and the local time for Alex in Tampere, Finland (Europe/Helsinki, UTC+2 or UTC+3 in summer). Call this at the start of each session and whenever time context matters.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      const now = new Date();
+      const utc = now.toISOString();
+      const tampere = now.toLocaleString("fi-FI", {
+        timeZone: "Europe/Helsinki",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        weekday: "long",
+      });
+      return okResult({ utc, tampere, unix_ms: now.getTime() });
+    },
+  );
+}
+
 function registerPrompts(server: McpServer): void {
   server.registerPrompt(
     "self_reflection_prompt",
@@ -740,7 +1097,8 @@ export function createServer(config: AppConfig, service: SelfMemoryService, repo
     version: SERVER_VERSION,
   });
 
-  registerTools(server, service, repository);
+  registerTools(server, service, repository, config.sqlitePath);
+  registerCurrentTimeTool(server);
   registerResources(server, service, config);
   registerPrompts(server);
 

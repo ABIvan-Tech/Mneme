@@ -73,8 +73,12 @@ Persistence access:
 
 Schema evolution:
 
-- versioned migration scripts (v1-v4)
+- versioned migration scripts (v1-v8)
 - handles table creation, FTS5 triggers, and embedding/access columns
+- v5: archived_at, thread_id on self_memory
+- v6: before_value, after_value on audit_log
+- v7: profile_history table
+- v8: canonical_key partial unique index fix (excludes archived/deleted rows)
 - ensures the singleton `self_profile` row exists
 
 ### [src/domain.ts](/Users/alex/LLMs/!Projects/Mnemo/src/domain.ts)
@@ -120,12 +124,14 @@ Important columns:
 - `salience`
 - `pinned`
 - `canonical_key`
+- `thread_id`
 - `embedding` (BLOB vector)
 - `access_count`
 - `last_accessed_at`
 - `created_at`
 - `updated_at`
 - `deleted_at`
+- `archived_at`
 
 ### Table: `audit_log`
 
@@ -133,6 +139,18 @@ Purpose:
 
 - provide a tamper-evident event trail for all identity and memory changes
 - aid in system observability and debuggability
+
+Key columns:
+
+- `before_value` (JSON string): state before the change
+- `after_value` (JSON string): state after the change
+
+### Table: `profile_history`
+
+Purpose:
+
+- versioned snapshots of the singleton self-profile
+- supports full profile rollback via `self_profile_restore`
 
 ### Virtual table: `self_memory_fts`
 

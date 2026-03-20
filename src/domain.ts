@@ -30,6 +30,8 @@ export interface SelfMemoryRow {
   created_at: number;
   updated_at: number;
   deleted_at: number | null;
+  archived_at?: number | null;
+  thread_id?: string | null;
 }
 
 export interface SelfMemoryEntry {
@@ -48,6 +50,8 @@ export interface SelfMemoryEntry {
   created_at: number;
   updated_at: number;
   deleted_at: number | null;
+  archived_at?: number | null;
+  thread_id?: string | null;
 }
 
 export interface SelfProfile {
@@ -75,6 +79,36 @@ export interface SelfProfilePatch {
   self_narrative?: string | null;
 }
 
+export interface ProfileHistoryRow {
+  id: string;
+  snapshot_at: number;
+  self_name: string | null;
+  core_identity: string | null;
+  communication_style: string | null;
+  relational_style: string | null;
+  empathy_style: string | null;
+  core_values: string | null;
+  boundaries: string | null;
+  self_narrative: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProfileHistoryEntry {
+  id: string;
+  snapshotAt: Date;
+  selfName: string | null;
+  coreIdentity: string | null;
+  communicationStyle: string | null;
+  relationalStyle: string | null;
+  empathyStyle: string | null;
+  coreValues: string | null;
+  boundaries: string | null;
+  selfNarrative: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export interface SelfSnapshot {
   generated_at: number;
   profile: SelfProfile;
@@ -90,5 +124,24 @@ export interface AuditLogEntry {
   target_type: "memory" | "profile" | "system";
   target_id: string | null;
   summary: string | null;
+  before_value?: string | null;
+  after_value?: string | null;
   created_at: number;
+}
+
+export interface HealthCheckResult {
+  totalMemories: number;
+  activeMemories: number;
+  pinnedMemories: number;
+  archivedMemories: number;
+  deletedMemories: number;
+  profileCompleteness: number;
+  anchorCount: number;
+  facetCoverage: string[];
+  salienceDistribution: {
+    low: number;
+    medium: number;
+    high: number;
+  };
+  warnings: string[];
 }

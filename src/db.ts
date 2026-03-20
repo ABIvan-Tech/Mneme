@@ -59,6 +59,7 @@ function initializeDatabase(db: Database): void {
 
   ensureSelfMemoryColumn(db, "pinned", "INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0, 1))");
   ensureSelfMemoryColumn(db, "canonical_key", "TEXT");
+  ensureSelfMemoryColumn(db, "archived_at", "INTEGER");
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_self_memory_facet ON self_memory(facet);
@@ -67,7 +68,9 @@ function initializeDatabase(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_self_memory_pinned ON self_memory(pinned, salience DESC, updated_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_self_memory_canonical_key_active
       ON self_memory(canonical_key)
-      WHERE canonical_key IS NOT NULL AND deleted_at IS NULL;
+      WHERE canonical_key IS NOT NULL
+        AND deleted_at IS NULL
+        AND archived_at IS NULL;
   `);
 
   db.exec(`

@@ -46,6 +46,57 @@ const MIGRATIONS: Migration[] = [
       ALTER TABLE self_memory ADD COLUMN last_accessed_at INTEGER;
     `,
   },
+  {
+    version: 5,
+    name: "add_memory_lifecycle_and_threading",
+    sql: `
+      ALTER TABLE self_memory ADD COLUMN thread_id TEXT;
+      CREATE INDEX IF NOT EXISTS idx_self_memory_archived_at ON self_memory(archived_at);
+      CREATE INDEX IF NOT EXISTS idx_self_memory_thread_id ON self_memory(thread_id);
+      CREATE INDEX IF NOT EXISTS idx_self_memory_active ON self_memory(deleted_at, archived_at, facet, salience);
+    `,
+  },
+  {
+    version: 6,
+    name: "add_audit_log_before_after_values",
+    sql: `
+      ALTER TABLE audit_log ADD COLUMN before_value TEXT;
+      ALTER TABLE audit_log ADD COLUMN after_value TEXT;
+    `,
+  },
+  {
+    version: 7,
+    name: "add_profile_history",
+    sql: `
+      CREATE TABLE IF NOT EXISTS profile_history (
+        id TEXT NOT NULL PRIMARY KEY,
+        snapshot_at INTEGER NOT NULL,
+        self_name TEXT,
+        core_identity TEXT,
+        communication_style TEXT,
+        relational_style TEXT,
+        empathy_style TEXT,
+        core_values TEXT,
+        boundaries TEXT,
+        self_narrative TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_profile_history_snapshot_at ON profile_history(snapshot_at DESC);
+    `,
+  },
+  {
+    version: 8,
+    name: "fix_canonical_key_active_unique_index_for_archived",
+    sql: `
+      DROP INDEX IF EXISTS idx_self_memory_canonical_key_active;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_self_memory_canonical_key_active
+        ON self_memory(canonical_key)
+        WHERE canonical_key IS NOT NULL
+          AND deleted_at IS NULL
+          AND archived_at IS NULL;
+    `,
+  },
 ];
 
 function ensureMigrationsTable(db: Database): void {

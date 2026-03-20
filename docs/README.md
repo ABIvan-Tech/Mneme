@@ -78,15 +78,23 @@ Reflection and import paths are merge-oriented. The system tries to refine and u
 - canonical in-place updates via `canonical_key`
 - Hybrid Semantic Search (Local Embeddings)
 - automatic deduplication (>0.92 cosine sim)
-- memory decay and access tracking
-- memory consolidation tools (self_memory_summarize / self_memory_purge)
-- audit log trail (self_audit_recent)
-- backup and restore tools (self_backup_create / self_backup_restore)
+- memory decay (salience) and access tracking
+- memory archive / unarchive lifecycle (`self_memory_archive`, `self_memory_unarchive`, `self_memory_restore`)
+- facet consolidation workflow (`self_facet_consolidate`, `self_facet_consolidate_apply`)
+- memory threading (`self_memory_thread_create`, `self_memory_add_to_thread`, `self_memory_get_thread`)
+- batch semantic search (`self_memory_search_batch`)
+- time-range filters on `self_memory_search`
+- memory consolidation tools (`self_memory_summarize` / `self_memory_purge`)
+- rich audit log trail with before/after values (`self_audit_recent`)
+- backup and restore tools (`self_backup_create` / `self_backup_restore`)
 - continuity bootstrap text
 - self-reflection prepare/apply flow
+- profile versioning and history (`self_profile_history`, `self_profile_restore`)
+- health check tool (`self_health_check`)
 - import/export
-- SSE transport for web clients
+- SSE transport with optional bearer-token auth
 - CLI for path/log overrides
+- configurable tuning knobs: `VECTOR_SIMILARITY_THRESHOLD`, `RRF_K`, `SALIENCE_DECAY_DAYS`, `MCP_AUTH_TOKEN`
 
 ### Explicitly Not Implemented
 

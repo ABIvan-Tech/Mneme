@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 
-import type {
+import {
+  memoryFacetValues,
+  type HealthCheckResult,
   MemoryFacet,
+  type ProfileHistoryEntry,
+  type ProfileHistoryRow,
   SelfMemoryEntry,
   SelfMemoryRow,
   SelfProfile,
@@ -9,7 +13,21 @@ import type {
   SelfSnapshot,
 } from "./domain.js";
 import type { EmbeddingProvider } from "./embeddings.js";
-import { contentTooLarge, memoryNotFound, updateFailed, validationFailed } from "./errors.js";
+import {
+  consolidationSourceDeleted,
+  consolidationSourceNotFound,
+  contentTooLarge,
+  memoryAlreadyArchived,
+  memoryAlreadyDeleted,
+  memoryNotArchived,
+  memoryNotFound,
+  profileHistoryNotFound,
+  SelfMemoryError,
+  SelfMemoryErrorCode,
+  threadNotFound,
+  updateFailed,
+  validationFailed,
+} from "./errors.js";
 import { SelfMemoryRepository, type SearchMode } from "./repository.js";
 
 export interface RememberSelfMemoryInput {
@@ -163,6 +181,10 @@ function normalizeTags(tags?: string[]): string[] {
   return [...new Set(normalized)];
 }
 
+function isMemoryFacet(value: string): value is MemoryFacet {
+  return memoryFacetValues.includes(value as MemoryFacet);
+}
+
 function mapMemory(row: SelfMemoryRow): SelfMemoryEntry {
   let embedding: number[] | undefined;
   if (row.embedding) {
@@ -174,6 +196,8 @@ function mapMemory(row: SelfMemoryRow): SelfMemoryEntry {
     tags: parseTags(row.tags),
     pinned: row.pinned === 1,
     embedding,
+    archived_at: row.archived_at ?? null,
+    thread_id: row.thread_id ?? null,
   };
 }
 
@@ -234,7 +258,10 @@ export class SelfMemoryService {
   constructor(
     private readonly repository: SelfMemoryRepository,
     private readonly maxMemoriesPerFacet: number,
+    private readonly vectorSimilarityThreshold = 0.92,
     private readonly embeddingProvider?: EmbeddingProvider,
+    private readonly maxContentLength = 10_000,
+    private readonly maxProfileFieldLength = 5_000,
   ) {}
 
   private async generateEmbedding(text: string): Promise<Buffer | null> {
@@ -246,13 +273,13 @@ export class SelfMemoryService {
   }
 
   public async remember(input: RememberSelfMemoryInput): Promise<SelfMemoryEntry> {
-    const content = requireNonEmptyText(input.content, "content");
+    const content = requireNonEmptyText(input.content, "content", this.maxContentLength);
     const embedding = await this.generateEmbedding(content);
 
     return this.repository.transaction(() => {
       // 1. Check for exact facet embedding collision
       if (embedding && !input.canonical_key) {
-        const duplicate = this.repository.findSimilarDuplicate(embedding, input.facet, 0.92);
+        const duplicate = this.repository.findSimilarDuplicate(embedding, input.facet, this.vectorSimilarityThreshold);
         if (duplicate) {
           const newSalience = Math.min(1.0, duplicate.salience + 0.1);
           const updated = this.repository.updateMemory(duplicate.id, {
@@ -340,7 +367,7 @@ export class SelfMemoryService {
     }
 
     if (typeof patch.content === "string") {
-      repositoryPatch.content = requireNonEmptyText(patch.content, "content");
+      repositoryPatch.content = requireNonEmptyText(patch.content, "content", this.maxContentLength);
     }
 
     if (typeof patch.facet === "string") {
@@ -402,12 +429,356 @@ export class SelfMemoryService {
     return deleted;
   }
 
+  public async restoreMemory(id: string): Promise<SelfMemoryEntry> {
+    const original = this.repository.findAnyById(id);
+    if (!original) {
+      throw memoryNotFound(id);
+    }
+
+    if (original.deleted_at === null) {
+      if (original.archived_at !== null && original.archived_at !== undefined) {
+        throw validationFailed("Memory is not deleted — use unarchive instead");
+      }
+
+      throw validationFailed("Memory is already active");
+    }
+
+    if (original.canonical_key !== null && original.canonical_key !== undefined) {
+      const activeWithSameKey = this.repository.findMemoryByCanonicalKey(original.canonical_key);
+      if (activeWithSameKey !== undefined && activeWithSameKey.id !== id) {
+        throw new SelfMemoryError(
+          SelfMemoryErrorCode.VALIDATION_FAILED,
+          `Cannot restore: an active memory with canonical key "${original.canonical_key}" already exists (id: ${activeWithSameKey.id})`,
+        );
+      }
+    }
+
+    const restored = this.repository.restoreMemory(id);
+    if (!restored) {
+      throw memoryNotFound(id);
+    }
+
+    this.repository.insertAuditLog({
+      action: "restore_memory",
+      targetType: "memory",
+      targetId: id,
+      summary: "Restored soft-deleted memory",
+      beforeValue: JSON.stringify(original),
+      afterValue: JSON.stringify(restored),
+    });
+
+    return mapMemory(restored);
+  }
+
+  public async archiveMemory(id: string): Promise<SelfMemoryEntry> {
+    const original = this.repository.findAnyById(id);
+    if (!original) {
+      throw memoryNotFound(id);
+    }
+
+    if (original.deleted_at !== null) {
+      throw memoryAlreadyDeleted(id);
+    }
+
+    if (original.archived_at !== null && original.archived_at !== undefined) {
+      throw memoryAlreadyArchived(id);
+    }
+
+    const archived = this.repository.archiveMemory(id);
+    if (!archived) {
+      throw updateFailed(id);
+    }
+
+    this.repository.insertAuditLog({
+      action: "archive_memory",
+      targetType: "memory",
+      targetId: id,
+      summary: "Archived memory",
+      beforeValue: JSON.stringify(original),
+      afterValue: JSON.stringify(archived),
+    });
+
+    return mapMemory(archived);
+  }
+
+  public async unarchiveMemory(id: string): Promise<SelfMemoryEntry> {
+    const original = this.repository.findAnyById(id);
+    if (!original) {
+      throw memoryNotFound(id);
+    }
+
+    if (original.deleted_at !== null) {
+      throw memoryAlreadyDeleted(id);
+    }
+
+    if (original.archived_at === null || original.archived_at === undefined) {
+      throw memoryNotArchived(id);
+    }
+
+    if (original.canonical_key !== null && original.canonical_key !== undefined) {
+      const activeWithSameKey = this.repository.findMemoryByCanonicalKey(original.canonical_key);
+      if (activeWithSameKey !== undefined && activeWithSameKey.id !== id) {
+        throw new SelfMemoryError(
+          SelfMemoryErrorCode.VALIDATION_FAILED,
+          `Cannot restore: an active memory with canonical key "${original.canonical_key}" already exists (id: ${activeWithSameKey.id})`,
+        );
+      }
+    }
+
+    const unarchived = this.repository.unarchiveMemory(id);
+    if (!unarchived) {
+      throw updateFailed(id);
+    }
+
+    this.repository.insertAuditLog({
+      action: "unarchive_memory",
+      targetType: "memory",
+      targetId: id,
+      summary: "Unarchived memory",
+      beforeValue: JSON.stringify(original),
+      afterValue: JSON.stringify(unarchived),
+    });
+
+    return mapMemory(unarchived);
+  }
+
+  public async searchBatch(
+    queries: Array<{ query: string; facet?: string; limit?: number }>,
+  ): Promise<Array<{ query: string; results: SelfMemoryEntry[]; searchMode: string }>> {
+    const batchResults: Array<{ query: string; results: SelfMemoryEntry[]; searchMode: string }> = [];
+
+    for (const item of queries) {
+      const limit = typeof item.limit === "number" && Number.isFinite(item.limit) && item.limit > 0
+        ? Math.floor(item.limit)
+        : 10;
+
+      let facet: MemoryFacet | undefined;
+      if (typeof item.facet === "string") {
+        if (!isMemoryFacet(item.facet)) {
+          throw validationFailed(`Invalid facet: ${item.facet}`);
+        }
+        facet = item.facet;
+      }
+
+      const result = await this.search({
+        query: item.query,
+        facet,
+        limit,
+      });
+
+      batchResults.push({
+        query: item.query,
+        results: result.rows,
+        searchMode: result.search_mode,
+      });
+    }
+
+    return batchResults;
+  }
+
+  public async healthCheck(): Promise<HealthCheckResult> {
+    const stats = this.repository.getHealthStats();
+    const profile = this.repository.getProfile();
+    const profileCompleteness = Math.round((countFilledProfileFields(profile) * 100) / 8);
+    const anchorCount = this.repository.listAnchors(Number.MAX_SAFE_INTEGER).length;
+    const facetCoverage = stats.facetsWithMemories;
+    const warnings: string[] = [];
+
+    if (profileCompleteness < 50) {
+      warnings.push("Profile completeness below 50%");
+    }
+
+    if (anchorCount === 0) {
+      warnings.push("No pinned identity anchors");
+    }
+
+    for (const facet of ["identity", "value", "boundary"]) {
+      if (!facetCoverage.includes(facet)) {
+        warnings.push(`Critical facet '${facet}' has no memories`);
+      }
+    }
+
+    if (stats.active < 3) {
+      warnings.push("Fewer than 3 active memories");
+    }
+
+    return {
+      totalMemories: stats.total,
+      activeMemories: stats.active,
+      pinnedMemories: stats.pinned,
+      archivedMemories: stats.archived,
+      deletedMemories: stats.deleted,
+      profileCompleteness,
+      anchorCount,
+      facetCoverage,
+      salienceDistribution: {
+        low: stats.salienceLow,
+        medium: stats.salienceMedium,
+        high: stats.salienceHigh,
+      },
+      warnings,
+    };
+  }
+
+  public async createMemoryThread(): Promise<string> {
+    return randomUUID();
+  }
+
+  public async addMemoryToThread(memoryId: string, threadId: string): Promise<SelfMemoryEntry> {
+    const trimmedThreadId = requireNonEmptyText(threadId, "threadId");
+    const memory = this.repository.findMemoryById(memoryId);
+
+    if (!memory) {
+      throw memoryNotFound(memoryId);
+    }
+
+    if (memory.deleted_at !== null) {
+      throw validationFailed("Cannot add deleted memory to a thread");
+    }
+
+    if (memory.archived_at !== null && memory.archived_at !== undefined) {
+      throw validationFailed("Cannot add archived memory to a thread");
+    }
+
+    this.repository.addMemoryToThread(memoryId, trimmedThreadId);
+
+    const updated = this.repository.findMemoryById(memoryId);
+    if (!updated) {
+      throw updateFailed(memoryId);
+    }
+
+    return mapMemory(updated);
+  }
+
+  public async getMemoryThread(threadId: string): Promise<SelfMemoryEntry[]> {
+    const trimmedThreadId = requireNonEmptyText(threadId, "threadId");
+    const rows = this.repository.getThreadMemories(trimmedThreadId);
+
+    if (rows.length === 0) {
+      throw threadNotFound(trimmedThreadId);
+    }
+
+    this.repository.recordAccess(rows.map((row) => row.id), Date.now());
+    return rows.map(mapMemory);
+  }
+
+  public async consolidateFacet(
+    facet: string,
+    salienceThreshold = 0.5,
+    limit = 20,
+  ): Promise<{
+    candidates: SelfMemoryEntry[];
+    facet: string;
+    salienceThreshold: number;
+  }> {
+    if (!isMemoryFacet(facet)) {
+      throw validationFailed(`Invalid facet: ${facet}`);
+    }
+
+    const threshold = clampSalience(salienceThreshold, 0.5);
+    const effectiveLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 20;
+    const rows = this.repository.findConsolidationCandidates(facet, threshold, effectiveLimit);
+
+    return {
+      candidates: rows.map(mapMemory),
+      facet,
+      salienceThreshold: threshold,
+    };
+  }
+
+  public async consolidateFacetApply(params: {
+    facet: string;
+    sourceIds: string[];
+    consolidatedTitle: string;
+    consolidatedContent: string;
+    consolidatedTags?: string[];
+    consolidatedSalience?: number;
+  }): Promise<{ created: SelfMemoryEntry; softDeletedCount: number }> {
+    if (!isMemoryFacet(params.facet)) {
+      throw validationFailed(`Invalid facet: ${params.facet}`);
+    }
+    const facet: MemoryFacet = params.facet;
+
+    const sourceIds = [...new Set(params.sourceIds.map((id) => requireNonEmptyText(id, "sourceId")))];
+    if (sourceIds.length < 2) {
+      throw validationFailed("At least two sourceIds are required for consolidation");
+    }
+
+    const sources = sourceIds.map((id) => this.repository.findMemoryById(id));
+    if (sources.some((source) => source === undefined)) {
+      throw consolidationSourceNotFound(sourceIds);
+    }
+
+    const sourceRows = sources as SelfMemoryRow[];
+    const deletedSourceIds = sourceRows
+      .filter((row) => row.deleted_at !== null)
+      .map((row) => row.id);
+
+    if (deletedSourceIds.length > 0) {
+      throw consolidationSourceDeleted(deletedSourceIds);
+    }
+
+    const embedding = await this.generateEmbedding(requireNonEmptyText(params.consolidatedContent, "consolidatedContent"));
+
+    return this.repository.transaction(() => {
+      const created = this.upsertMemory(
+        {
+          title: normalizeNullableText(params.consolidatedTitle) ?? null,
+          content: params.consolidatedContent,
+          facet,
+          tags: params.consolidatedTags,
+          salience: params.consolidatedSalience,
+        },
+        { embedding },
+      ).memory;
+
+      const deletedAt = Date.now();
+      for (const sourceId of sourceIds) {
+        this.repository.softDeleteMemory(sourceId, deletedAt);
+      }
+
+      this.repository.insertAuditLog({
+        action: "consolidate_facet",
+        targetType: "memory",
+        targetId: created.id,
+        summary: `Consolidated ${sourceIds.length} memories for facet=${params.facet}`,
+        beforeValue: JSON.stringify(sourceIds),
+        afterValue: created.id,
+      });
+
+      return {
+        created,
+        softDeletedCount: sourceIds.length,
+      };
+    });
+  }
+
   public getProfile(): SelfProfile {
     return this.repository.getProfile();
   }
 
   public updateProfile(patch: SelfProfilePatch): SelfProfile {
+    const profileFields: Array<keyof SelfProfilePatch> = [
+      "self_name",
+      "core_identity",
+      "communication_style",
+      "relational_style",
+      "empathy_style",
+      "core_values",
+      "boundaries",
+      "self_narrative",
+    ];
+
+    for (const field of profileFields) {
+      const value = patch[field];
+      if (typeof value === "string" && value.trim().length > 0) {
+        requireNonEmptyText(value, field, this.maxProfileFieldLength);
+      }
+    }
+
     return this.repository.transaction(() => {
+      this.snapshotProfileSync();
+
       const current = this.repository.getProfile();
       const next = mergeProfilePatch(current, patch);
       const saved = this.repository.saveProfile(next);
@@ -421,6 +792,92 @@ export class SelfMemoryService {
       });
 
       return saved;
+    });
+  }
+
+  private snapshotProfileSync(): void {
+    const current = this.repository.getProfile();
+    if (!current) {
+      return;
+    }
+
+    const snapshot: ProfileHistoryRow = {
+      id: randomUUID(),
+      snapshot_at: Date.now(),
+      self_name: current.self_name,
+      core_identity: current.core_identity,
+      communication_style: current.communication_style,
+      relational_style: current.relational_style,
+      empathy_style: current.empathy_style,
+      core_values: current.core_values,
+      boundaries: current.boundaries,
+      self_narrative: current.self_narrative,
+      created_at: current.created_at,
+      updated_at: current.updated_at,
+    };
+
+    this.repository.insertProfileSnapshot(snapshot);
+  }
+
+  private async snapshotProfile(): Promise<void> {
+    this.snapshotProfileSync();
+  }
+
+  public async listProfileHistory(limit?: number): Promise<ProfileHistoryEntry[]> {
+    const effectiveLimit = typeof limit === "number" && Number.isFinite(limit) && limit > 0
+      ? Math.floor(limit)
+      : 50;
+
+    return this.repository.listProfileHistory(effectiveLimit).map((row) => ({
+      id: row.id,
+      snapshotAt: new Date(row.snapshot_at),
+      selfName: row.self_name,
+      coreIdentity: row.core_identity,
+      communicationStyle: row.communication_style,
+      relationalStyle: row.relational_style,
+      empathyStyle: row.empathy_style,
+      coreValues: row.core_values,
+      boundaries: row.boundaries,
+      selfNarrative: row.self_narrative,
+      createdAt: new Date(row.created_at),
+      updatedAt: new Date(row.updated_at),
+    }));
+  }
+
+  public async restoreProfile(snapshotId: string): Promise<SelfProfile> {
+    const normalizedSnapshotId = requireNonEmptyText(snapshotId, "snapshotId");
+    const snapshot = this.repository.findProfileSnapshot(normalizedSnapshotId);
+    if (!snapshot) {
+      throw profileHistoryNotFound(normalizedSnapshotId);
+    }
+
+    return this.repository.transaction(() => {
+      this.snapshotProfileSync();
+
+      const beforeProfile = this.repository.getProfile();
+      const patch: SelfProfilePatch = {
+        self_name: snapshot.self_name,
+        core_identity: snapshot.core_identity,
+        communication_style: snapshot.communication_style,
+        relational_style: snapshot.relational_style,
+        empathy_style: snapshot.empathy_style,
+        core_values: snapshot.core_values,
+        boundaries: snapshot.boundaries,
+        self_narrative: snapshot.self_narrative,
+      };
+
+      const restored = this.repository.saveProfile(mergeProfilePatch(beforeProfile, patch));
+
+      this.repository.insertAuditLog({
+        action: "restore_profile",
+        targetType: "profile",
+        targetId: "self",
+        summary: `Restored profile from snapshot ${normalizedSnapshotId}`,
+        beforeValue: JSON.stringify(beforeProfile),
+        afterValue: JSON.stringify(restored),
+      });
+
+      return restored;
     });
   }
 
@@ -515,15 +972,40 @@ export class SelfMemoryService {
   }
 
   public async applyReflection(input: ReflectionApplyInput): Promise<ReflectionApplyResult> {
+    if (input.profile_patch) {
+      const patch = input.profile_patch;
+      const fields: Array<keyof typeof patch> = [
+        "self_name",
+        "core_identity",
+        "communication_style",
+        "relational_style",
+        "empathy_style",
+        "core_values",
+        "boundaries",
+        "self_narrative",
+      ];
+
+      for (const field of fields) {
+        const value = patch[field];
+        if (value !== null && value !== undefined) {
+          requireNonEmptyText(String(value), field, this.maxProfileFieldLength);
+        }
+      }
+    }
+
     const memoryEntries = input.memory_entries ?? [];
     const processedMemories = await Promise.all(
       memoryEntries.map(async (entry) => ({
         entry,
-        embedding: await this.generateEmbedding(requireNonEmptyText(entry.content, "content")),
+        embedding: await this.generateEmbedding(requireNonEmptyText(entry.content, "content", this.maxContentLength)),
       }))
     );
 
     return this.repository.transaction(() => {
+      if (input.profile_patch) {
+        this.snapshotProfileSync();
+      }
+
       const beforeProfile = this.repository.getProfile();
       const nextProfile = input.profile_patch
         ? this.repository.saveProfile(mergeProfilePatch(beforeProfile, input.profile_patch))
@@ -560,15 +1042,49 @@ export class SelfMemoryService {
     updated_count: number;
     imported_memories: SelfMemoryEntry[];
   }> {
+    if (payload.profile) {
+      const profile = payload.profile;
+      const fields: Array<
+        "self_name" |
+        "core_identity" |
+        "communication_style" |
+        "relational_style" |
+        "empathy_style" |
+        "core_values" |
+        "boundaries" |
+        "self_narrative"
+      > = [
+        "self_name",
+        "core_identity",
+        "communication_style",
+        "relational_style",
+        "empathy_style",
+        "core_values",
+        "boundaries",
+        "self_narrative",
+      ];
+
+      for (const field of fields) {
+        const value = profile[field];
+        if (value !== null && value !== undefined) {
+          requireNonEmptyText(String(value), field, this.maxProfileFieldLength);
+        }
+      }
+    }
+
     const memoryEntries = payload.memories ?? [];
     const processedMemories = await Promise.all(
       memoryEntries.map(async (memory) => ({
         memory,
-        embedding: await this.generateEmbedding(requireNonEmptyText(memory.content, "content")),
+        embedding: await this.generateEmbedding(requireNonEmptyText(memory.content, "content", this.maxContentLength)),
       }))
     );
 
     return this.repository.transaction(() => {
+      if (payload.profile) {
+        this.snapshotProfileSync();
+      }
+
       let profileUpdated = false;
 
       if (payload.profile) {
@@ -673,7 +1189,7 @@ export class SelfMemoryService {
     const title = normalizeNullableText(input.title);
     const source = normalizeNullableText(input.source);
     const canonicalKey = normalizeCanonicalKey(input.canonical_key);
-    const content = requireNonEmptyText(input.content, "content");
+    const content = requireNonEmptyText(input.content, "content", this.maxContentLength);
     const salience = clampSalience(input.salience, 0.6);
     const tags = JSON.stringify(normalizeTags(input.tags));
     const pinned = input.pinned ? 1 : 0;

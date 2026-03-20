@@ -4,6 +4,8 @@ dist/
 *.log
 .github/
 .vscode/
+.agent-memory/
+scripts/
 
 # Database files
 data/*.json

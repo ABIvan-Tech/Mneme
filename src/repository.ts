@@ -1,6 +1,6 @@
 import type { Database, Statement } from "better-sqlite3";
 
-import type { AuditLogEntry, MemoryFacet, SelfMemoryRow, SelfProfile } from "./domain.js";
+import type { AuditLogEntry, MemoryFacet, ProfileHistoryRow, SelfMemoryRow, SelfProfile } from "./domain.js";
 
 export interface CreateSelfMemoryInput {
   id: string;
@@ -42,9 +42,47 @@ export interface MemoryQueryOptions {
 export interface SearchSelfMemoryOptions extends MemoryQueryOptions {
   limit: number;
   queryEmbedding?: Buffer;
+  createdAfter?: number;
+  createdBefore?: number;
+  updatedAfter?: number;
+  updatedBefore?: number;
+}
+
+export interface SelfMemoryRepositoryOptions {
+  rrfK?: number;
+  salienceDecayDays?: number;
 }
 
 export type SearchMode = "fts" | "like" | "hybrid" | "vector";
+
+interface InsertAuditLogEntry {
+  action: string;
+  targetType: string;
+  targetId: string;
+  summary?: string;
+  beforeValue?: string | null;
+  afterValue?: string | null;
+}
+
+interface StatusCountsRow {
+  total: number;
+  active: number;
+  pinned: number;
+  archived: number;
+  deleted: number;
+}
+
+interface HealthStatsAggregateRow extends StatusCountsRow {
+  salience_low: number;
+  salience_medium: number;
+  salience_high: number;
+}
+
+function isLegacyAuditLogEntry(
+  entry: InsertAuditLogEntry | Omit<AuditLogEntry, "id">,
+): entry is Omit<AuditLogEntry, "id"> {
+  return "target_type" in entry;
+}
 
 function calculateCosineSimilarity(a: Buffer, b: Buffer): number {
   const floatsA = new Float32Array(a.buffer, a.byteOffset, a.byteLength / 4);
@@ -88,73 +126,214 @@ function makeExclusionClause(excludeIds: string[]): { clause: string; params: st
   };
 }
 
+function buildTimeRangeConditions(
+  options: SearchSelfMemoryOptions,
+  columnPrefix = "",
+): { conditions: string[]; params: number[] } {
+  const conditions: string[] = [];
+  const params: number[] = [];
+
+  if (typeof options.createdAfter === "number") {
+    conditions.push(`${columnPrefix}created_at >= ?`);
+    params.push(options.createdAfter);
+  }
+
+  if (typeof options.createdBefore === "number") {
+    conditions.push(`${columnPrefix}created_at <= ?`);
+    params.push(options.createdBefore);
+  }
+
+  if (typeof options.updatedAfter === "number") {
+    conditions.push(`${columnPrefix}updated_at >= ?`);
+    params.push(options.updatedAfter);
+  }
+
+  if (typeof options.updatedBefore === "number") {
+    conditions.push(`${columnPrefix}updated_at <= ?`);
+    params.push(options.updatedBefore);
+  }
+
+  return { conditions, params };
+}
+
 export class SelfMemoryRepository {
+  private readonly rrfK: number;
+  private readonly salienceDecayMs: number;
+
   // Cached prepared statements for hot-path queries
   private readonly stmts: {
     findById: Statement;
+    findDeletedById: Statement;
+    findArchivedById: Statement;
+    findAnyById: Statement;
     findByCanonicalKey: Statement;
     insertMemory: Statement;
     softDelete: Statement;
+    restoreMemory: Statement;
+    archiveMemory: Statement;
+    unarchiveMemory: Statement;
+    findRestoredById: Statement;
+    findUnarchivedById: Statement;
     getProfile: Statement;
     countByFacet: Statement;
     countPinned: Statement;
     exportMemories: Statement;
     listAnchors: Statement;
     memoryCount: Statement;
+    countByStatus: Statement;
+    healthStats: Statement;
+    listActiveFacets: Statement;
     dbPageCount: Statement;
     dbPageSize: Statement;
     insertAuditLog: Statement;
     listAuditLogs: Statement;
+    insertProfileSnapshot: Statement;
+    listProfileHistory: Statement;
+    findProfileSnapshot: Statement;
     recordAccess: Statement;
     purgeDeletedMemories: Statement;
+    addMemoryToThread: Statement;
+    getThreadMemories: Statement;
+    findConsolidationCandidates: Statement;
     findLowestScoringMemory: Statement;
   };
 
-  constructor(private readonly db: Database) {
+  constructor(private readonly db: Database, options: SelfMemoryRepositoryOptions = {}) {
+    const configuredRrfK = options.rrfK;
+    this.rrfK = typeof configuredRrfK === "number" && Number.isFinite(configuredRrfK) && configuredRrfK > 0
+      ? configuredRrfK
+      : 60;
+
+    const configuredDecayDays = options.salienceDecayDays;
+    const decayDays = typeof configuredDecayDays === "number" && Number.isFinite(configuredDecayDays) && configuredDecayDays > 0
+      ? configuredDecayDays
+      : 90;
+    this.salienceDecayMs = decayDays * 24 * 60 * 60 * 1000;
+
     this.stmts = {
       findById: db.prepare(
-        `SELECT * FROM self_memory WHERE id = ? AND deleted_at IS NULL`,
+        `SELECT * FROM self_memory WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL`,
+      ),
+      findDeletedById: db.prepare(
+        `SELECT * FROM self_memory WHERE id = ? AND deleted_at IS NOT NULL`,
+      ),
+      findArchivedById: db.prepare(
+        `SELECT * FROM self_memory WHERE id = ? AND archived_at IS NOT NULL AND deleted_at IS NULL`,
+      ),
+      findAnyById: db.prepare(
+        `SELECT * FROM self_memory WHERE id = ?`,
       ),
       findByCanonicalKey: db.prepare(
-        `SELECT * FROM self_memory WHERE canonical_key = ? AND deleted_at IS NULL`,
+        `SELECT * FROM self_memory WHERE canonical_key = ? AND deleted_at IS NULL AND archived_at IS NULL`,
       ),
       insertMemory: db.prepare(
         `INSERT INTO self_memory (
           id, title, content, facet, salience, source, tags,
-          pinned, canonical_key, embedding, access_count, last_accessed_at, created_at, updated_at, deleted_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+          pinned, canonical_key, embedding, access_count, last_accessed_at, created_at, updated_at, deleted_at, archived_at, thread_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
       ),
       softDelete: db.prepare(
         `UPDATE self_memory SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`,
+      ),
+      restoreMemory: db.prepare(
+        `UPDATE self_memory SET deleted_at = NULL, archived_at = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NOT NULL`,
+      ),
+      archiveMemory: db.prepare(
+        `UPDATE self_memory SET archived_at = ? WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL`,
+      ),
+      unarchiveMemory: db.prepare(
+        `UPDATE self_memory SET archived_at = NULL WHERE id = ? AND deleted_at IS NULL AND archived_at IS NOT NULL`,
+      ),
+      findRestoredById: db.prepare(
+        `SELECT * FROM self_memory WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL`,
+      ),
+      findUnarchivedById: db.prepare(
+        `SELECT * FROM self_memory WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL`,
       ),
       getProfile: db.prepare(
         `SELECT * FROM self_profile WHERE id = 'self'`,
       ),
       countByFacet: db.prepare(
-        `SELECT facet, COUNT(*) AS count FROM self_memory WHERE deleted_at IS NULL GROUP BY facet`,
+        `SELECT facet, COUNT(*) AS count
+         FROM self_memory
+         WHERE deleted_at IS NULL AND archived_at IS NULL
+         GROUP BY facet`,
       ),
       countPinned: db.prepare(
-        `SELECT COUNT(*) AS count FROM self_memory WHERE deleted_at IS NULL AND pinned = 1`,
+        `SELECT COUNT(*) AS count
+         FROM self_memory
+         WHERE deleted_at IS NULL AND archived_at IS NULL AND pinned = 1`,
       ),
       exportMemories: db.prepare(
-        `SELECT * FROM self_memory WHERE deleted_at IS NULL ORDER BY pinned DESC, updated_at DESC`,
+        `SELECT * FROM self_memory
+         WHERE deleted_at IS NULL AND archived_at IS NULL
+         ORDER BY pinned DESC, updated_at DESC`,
       ),
       listAnchors: db.prepare(
         `SELECT * FROM self_memory
-         WHERE deleted_at IS NULL AND pinned = 1
+         WHERE deleted_at IS NULL AND archived_at IS NULL AND pinned = 1
          ORDER BY salience DESC, updated_at DESC
          LIMIT ?`,
       ),
       memoryCount: db.prepare(
-        `SELECT COUNT(*) AS count FROM self_memory WHERE deleted_at IS NULL`,
+        `SELECT COUNT(*) AS count FROM self_memory WHERE deleted_at IS NULL AND archived_at IS NULL`,
+      ),
+      countByStatus: db.prepare(
+        `SELECT
+          COUNT(*) AS total,
+          COALESCE(SUM(CASE WHEN deleted_at IS NULL AND archived_at IS NULL THEN 1 ELSE 0 END), 0) AS active,
+          COALESCE(SUM(CASE WHEN deleted_at IS NULL AND archived_at IS NULL AND pinned = 1 THEN 1 ELSE 0 END), 0) AS pinned,
+          COALESCE(SUM(CASE WHEN deleted_at IS NULL AND archived_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS archived,
+          COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS deleted
+         FROM self_memory`,
+      ),
+      healthStats: db.prepare(
+        `SELECT
+          COUNT(*) AS total,
+          COALESCE(SUM(CASE WHEN deleted_at IS NULL AND archived_at IS NULL THEN 1 ELSE 0 END), 0) AS active,
+          COALESCE(SUM(CASE WHEN deleted_at IS NULL AND archived_at IS NULL AND pinned = 1 THEN 1 ELSE 0 END), 0) AS pinned,
+          COALESCE(SUM(CASE WHEN deleted_at IS NULL AND archived_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS archived,
+          COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS deleted,
+          COALESCE(SUM(CASE WHEN deleted_at IS NULL AND archived_at IS NULL AND salience < 0.4 THEN 1 ELSE 0 END), 0) AS salience_low,
+          COALESCE(SUM(CASE WHEN deleted_at IS NULL AND archived_at IS NULL AND salience >= 0.4 AND salience < 0.7 THEN 1 ELSE 0 END), 0) AS salience_medium,
+          COALESCE(SUM(CASE WHEN deleted_at IS NULL AND archived_at IS NULL AND salience >= 0.7 THEN 1 ELSE 0 END), 0) AS salience_high
+         FROM self_memory`,
+      ),
+      listActiveFacets: db.prepare(
+        `SELECT DISTINCT facet
+         FROM self_memory
+         WHERE deleted_at IS NULL AND archived_at IS NULL
+         ORDER BY facet ASC`,
       ),
       dbPageCount: db.prepare(`PRAGMA page_count`),
       dbPageSize: db.prepare(`PRAGMA page_size`),
       insertAuditLog: db.prepare(
-        `INSERT INTO audit_log (action, target_type, target_id, summary, created_at) VALUES (?, ?, ?, ?, ?)`
+        `INSERT INTO audit_log (action, target_type, target_id, summary, before_value, after_value, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
       ),
       listAuditLogs: db.prepare(
         `SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?`
+      ),
+      insertProfileSnapshot: db.prepare(
+        `INSERT INTO profile_history (
+          id,
+          snapshot_at,
+          self_name,
+          core_identity,
+          communication_style,
+          relational_style,
+          empathy_style,
+          core_values,
+          boundaries,
+          self_narrative,
+          created_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      listProfileHistory: db.prepare(
+        `SELECT * FROM profile_history ORDER BY snapshot_at DESC LIMIT ?`,
+      ),
+      findProfileSnapshot: db.prepare(
+        `SELECT * FROM profile_history WHERE id = ?`,
       ),
       recordAccess: db.prepare(
         `UPDATE self_memory SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?`
@@ -162,10 +341,34 @@ export class SelfMemoryRepository {
       purgeDeletedMemories: db.prepare(
         `DELETE FROM self_memory WHERE deleted_at IS NOT NULL AND deleted_at < ?`
       ),
+      addMemoryToThread: db.prepare(
+        `UPDATE self_memory
+         SET thread_id = ?
+         WHERE id = ?
+           AND deleted_at IS NULL
+           AND archived_at IS NULL
+           AND thread_id IS NULL`,
+      ),
+      getThreadMemories: db.prepare(
+        `SELECT * FROM self_memory
+         WHERE thread_id = ?
+           AND deleted_at IS NULL
+           AND archived_at IS NULL
+         ORDER BY created_at ASC`,
+      ),
+      findConsolidationCandidates: db.prepare(
+        `SELECT * FROM self_memory
+         WHERE deleted_at IS NULL
+           AND archived_at IS NULL
+           AND facet = ?
+           AND salience < ?
+         ORDER BY salience ASC, updated_at ASC
+         LIMIT ?`,
+      ),
       findLowestScoringMemory: db.prepare(
         `SELECT * FROM self_memory 
-         WHERE deleted_at IS NULL AND facet = ? AND pinned = 0
-         ORDER BY (salience * MAX(0.3, 1.0 - ((unixepoch() * 1000 - updated_at) / 7776000000.0)) * (1.0 + (COALESCE(access_count, 0) * 0.05))) ASC
+         WHERE deleted_at IS NULL AND archived_at IS NULL AND facet = ? AND pinned = 0
+         ORDER BY (salience * MAX(0.3, 1.0 - ((unixepoch() * 1000 - updated_at) / ?)) * (1.0 + (COALESCE(access_count, 0) * 0.05))) ASC
          LIMIT 1`
       ),
     };
@@ -210,12 +413,24 @@ export class SelfMemoryRepository {
     return this.stmts.findById.get(id) as SelfMemoryRow | undefined;
   }
 
+  public findDeletedById(id: string): SelfMemoryRow | undefined {
+    return this.stmts.findDeletedById.get(id) as SelfMemoryRow | undefined;
+  }
+
+  public findArchivedById(id: string): SelfMemoryRow | undefined {
+    return this.stmts.findArchivedById.get(id) as SelfMemoryRow | undefined;
+  }
+
+  public findAnyById(id: string): SelfMemoryRow | undefined {
+    return this.stmts.findAnyById.get(id) as SelfMemoryRow | undefined;
+  }
+
   public findMemoryByCanonicalKey(canonicalKey: string): SelfMemoryRow | undefined {
     return this.stmts.findByCanonicalKey.get(canonicalKey) as SelfMemoryRow | undefined;
   }
 
   public listRecent(limit: number, options: MemoryQueryOptions = {}): SelfMemoryRow[] {
-    const conditions = ["deleted_at IS NULL"];
+    const conditions = ["deleted_at IS NULL", "archived_at IS NULL"];
     const params: Array<number | string> = [];
 
     if (options.facet) {
@@ -241,9 +456,9 @@ export class SelfMemoryRepository {
     return this.stmts.listAnchors.all(limit) as SelfMemoryRow[];
   }
 
-  public findSimilarDuplicate(embedding: Buffer, facet: string, threshold: number = 0.92): SelfMemoryRow | undefined {
+  public findSimilarDuplicate(embedding: Buffer, facet: string, threshold: number): SelfMemoryRow | undefined {
     const rows = this.db.prepare(
-      `SELECT * FROM self_memory WHERE deleted_at IS NULL AND facet = ? AND embedding IS NOT NULL`
+      `SELECT * FROM self_memory WHERE deleted_at IS NULL AND archived_at IS NULL AND facet = ? AND embedding IS NOT NULL`
     ).all(facet) as SelfMemoryRow[];
 
     let bestMem: SelfMemoryRow | undefined = undefined;
@@ -269,17 +484,17 @@ export class SelfMemoryRepository {
 
     return this.db.prepare(
       `SELECT * FROM self_memory
-       WHERE deleted_at IS NULL${exclusion.clause}
+       WHERE deleted_at IS NULL AND archived_at IS NULL${exclusion.clause}
        ORDER BY 
          pinned DESC, 
-         salience * MAX(0.3, 1.0 - ((unixepoch() * 1000 - updated_at) / 7776000000.0)) * (1.0 + (COALESCE(access_count, 0) * 0.05)) DESC, 
+         salience * MAX(0.3, 1.0 - ((unixepoch() * 1000 - updated_at) / ?)) * (1.0 + (COALESCE(access_count, 0) * 0.05)) DESC,
          updated_at DESC
        LIMIT ?`,
-    ).all(...exclusion.params, limit) as SelfMemoryRow[];
+    ).all(...exclusion.params, this.salienceDecayMs, limit) as SelfMemoryRow[];
   }
 
   private searchMemoriesByVector(queryEmbedding: Buffer, options: SearchSelfMemoryOptions): { row: SelfMemoryRow, score: number }[] {
-    const conditions = ["deleted_at IS NULL", "embedding IS NOT NULL"];
+    const conditions = ["deleted_at IS NULL", "archived_at IS NULL", "embedding IS NOT NULL"];
     const params: Array<number | string> = [];
 
     if (options.facet) {
@@ -290,6 +505,10 @@ export class SelfMemoryRepository {
     if (options.pinnedOnly) {
       conditions.push("pinned = 1");
     }
+
+    const timeRange = buildTimeRangeConditions(options);
+    conditions.push(...timeRange.conditions);
+    params.push(...timeRange.params);
 
     const rows = this.db.prepare(
       `SELECT * FROM self_memory WHERE ${conditions.join(" AND ")}`
@@ -309,13 +528,21 @@ export class SelfMemoryRepository {
     let isFtsValid = false;
 
     if (ftsQuery) {
-      const facetClause = options.facet ? "AND m.facet = ?" : "";
-      const pinnedClause = options.pinnedOnly ? "AND m.pinned = 1" : "";
+      const conditions = ["m.deleted_at IS NULL", "m.archived_at IS NULL"];
       const params: Array<number | string> = [ftsQuery];
 
       if (options.facet) {
+        conditions.push("m.facet = ?");
         params.push(options.facet);
       }
+
+      if (options.pinnedOnly) {
+        conditions.push("m.pinned = 1");
+      }
+
+      const timeRange = buildTimeRangeConditions(options, "m.");
+      conditions.push(...timeRange.conditions);
+      params.push(...timeRange.params);
 
       params.push(options.limit * 2); // Get more candidates for potential RRF
 
@@ -325,9 +552,7 @@ export class SelfMemoryRepository {
            FROM self_memory_fts
            JOIN self_memory m ON m.rowid = self_memory_fts.rowid
            WHERE self_memory_fts MATCH ?
-             AND m.deleted_at IS NULL
-             ${facetClause}
-             ${pinnedClause}
+             AND ${conditions.join(" AND ")}
            ORDER BY bm25(self_memory_fts, 4.0, 1.0, 2.0)
            LIMIT ?`,
         ).all(...params) as SelfMemoryRow[];
@@ -349,16 +574,15 @@ export class SelfMemoryRepository {
       }
 
       // We have both FTS and vector results, apply Reciprocal Rank Fusion (RRF)
-      const K = 60;
       const scores = new Map<string, { row: SelfMemoryRow, score: number }>();
 
       ftsRows.forEach((row, index) => {
-        const rrfScore = 1 / (K + index + 1);
+        const rrfScore = 1 / (this.rrfK + index + 1);
         scores.set(row.id, { row, score: rrfScore });
       });
 
       vectorCandidates.forEach((row, index) => {
-        const rrfScore = 1 / (K + index + 1);
+        const rrfScore = 1 / (this.rrfK + index + 1);
         const existing = scores.get(row.id);
         if (existing) {
           existing.score += rrfScore;
@@ -400,6 +624,7 @@ export class SelfMemoryRepository {
     const pattern = `%${query.trim().toLowerCase()}%`;
     const conditions = [
       "deleted_at IS NULL",
+      "archived_at IS NULL",
       "(LOWER(COALESCE(title, '')) LIKE ? OR LOWER(content) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(COALESCE(canonical_key, '')) LIKE ?)",
     ];
     const params: Array<number | string> = [pattern, pattern, pattern, pattern];
@@ -413,7 +638,11 @@ export class SelfMemoryRepository {
       conditions.push("pinned = 1");
     }
 
-    params.push(pattern, pattern, pattern, pattern, options.limit);
+    const timeRange = buildTimeRangeConditions(options);
+    conditions.push(...timeRange.conditions);
+    params.push(...timeRange.params);
+
+    params.push(pattern, pattern, pattern, pattern, this.salienceDecayMs, options.limit);
 
     return this.db.prepare(
       `SELECT *
@@ -428,7 +657,7 @@ export class SelfMemoryRepository {
            WHEN LOWER(tags) LIKE ? THEN 1
            ELSE 0
          END DESC,
-         salience * MAX(0.3, 1.0 - ((unixepoch() * 1000 - updated_at) / 7776000000.0)) * (1.0 + (COALESCE(access_count, 0) * 0.05)) DESC,
+           salience * MAX(0.3, 1.0 - ((unixepoch() * 1000 - updated_at) / ?)) * (1.0 + (COALESCE(access_count, 0) * 0.05)) DESC,
          updated_at DESC
        LIMIT ?`,
     ).all(...params) as SelfMemoryRow[];
@@ -501,6 +730,33 @@ export class SelfMemoryRepository {
     return result.changes;
   }
 
+  public restoreMemory(id: string): SelfMemoryRow | undefined {
+    const result = this.stmts.restoreMemory.run(Date.now(), id);
+    if (result.changes === 0) {
+      return undefined;
+    }
+
+    return this.stmts.findRestoredById.get(id) as SelfMemoryRow | undefined;
+  }
+
+  public archiveMemory(id: string): SelfMemoryRow | undefined {
+    const result = this.stmts.archiveMemory.run(Date.now(), id);
+    if (result.changes === 0) {
+      return undefined;
+    }
+
+    return this.stmts.findArchivedById.get(id) as SelfMemoryRow | undefined;
+  }
+
+  public unarchiveMemory(id: string): SelfMemoryRow | undefined {
+    const result = this.stmts.unarchiveMemory.run(id);
+    if (result.changes === 0) {
+      return undefined;
+    }
+
+    return this.stmts.findUnarchivedById.get(id) as SelfMemoryRow | undefined;
+  }
+
   public getProfile(): SelfProfile {
     return this.stmts.getProfile.get() as SelfProfile;
   }
@@ -570,6 +826,17 @@ export class SelfMemoryRepository {
     return row.count;
   }
 
+  public countByStatus(): { total: number; active: number; pinned: number; archived: number; deleted: number } {
+    const row = this.stmts.countByStatus.get() as StatusCountsRow;
+    return {
+      total: row.total,
+      active: row.active,
+      pinned: row.pinned,
+      archived: row.archived,
+      deleted: row.deleted,
+    };
+  }
+
   public dbSizeBytes(): number {
     const pageCount = (this.stmts.dbPageCount.get() as { page_count: number }).page_count;
     const pageSize = (this.stmts.dbPageSize.get() as { page_size: number }).page_size;
@@ -580,13 +847,36 @@ export class SelfMemoryRepository {
     return this.stmts.exportMemories.all() as SelfMemoryRow[];
   }
 
-  public insertAuditLog(log: Omit<AuditLogEntry, "id">): void {
+  public insertAuditLog(entry: InsertAuditLogEntry): void;
+  public insertAuditLog(log: Omit<AuditLogEntry, "id">): void;
+  public insertAuditLog(entryOrLog: InsertAuditLogEntry | Omit<AuditLogEntry, "id">): void {
+    const action = entryOrLog.action;
+    const summary = entryOrLog.summary ?? null;
+
+    const targetType = isLegacyAuditLogEntry(entryOrLog)
+      ? entryOrLog.target_type
+      : entryOrLog.targetType;
+    const targetId = isLegacyAuditLogEntry(entryOrLog)
+      ? entryOrLog.target_id
+      : entryOrLog.targetId;
+    const beforeValue = isLegacyAuditLogEntry(entryOrLog)
+      ? (entryOrLog.before_value ?? null)
+      : (entryOrLog.beforeValue ?? null);
+    const afterValue = isLegacyAuditLogEntry(entryOrLog)
+      ? (entryOrLog.after_value ?? null)
+      : (entryOrLog.afterValue ?? null);
+    const createdAt = isLegacyAuditLogEntry(entryOrLog)
+      ? entryOrLog.created_at
+      : Date.now();
+
     this.stmts.insertAuditLog.run(
-      log.action,
-      log.target_type,
-      log.target_id,
-      log.summary,
-      log.created_at
+      action,
+      targetType,
+      targetId,
+      summary,
+      beforeValue,
+      afterValue,
+      createdAt,
     );
   }
 
@@ -599,13 +889,79 @@ export class SelfMemoryRepository {
     return result.changes;
   }
 
+  public insertProfileSnapshot(snapshot: ProfileHistoryRow): void {
+    this.stmts.insertProfileSnapshot.run(
+      snapshot.id,
+      snapshot.snapshot_at,
+      snapshot.self_name,
+      snapshot.core_identity,
+      snapshot.communication_style,
+      snapshot.relational_style,
+      snapshot.empathy_style,
+      snapshot.core_values,
+      snapshot.boundaries,
+      snapshot.self_narrative,
+      snapshot.created_at,
+      snapshot.updated_at,
+    );
+  }
+
+  public listProfileHistory(limit = 50): ProfileHistoryRow[] {
+    return this.stmts.listProfileHistory.all(limit) as ProfileHistoryRow[];
+  }
+
+  public findProfileSnapshot(id: string): ProfileHistoryRow | undefined {
+    return this.stmts.findProfileSnapshot.get(id) as ProfileHistoryRow | undefined;
+  }
+
+  public addMemoryToThread(memoryId: string, threadId: string): void {
+    this.stmts.addMemoryToThread.run(threadId, memoryId);
+  }
+
+  public getThreadMemories(threadId: string): SelfMemoryRow[] {
+    return this.stmts.getThreadMemories.all(threadId) as SelfMemoryRow[];
+  }
+
+  public findConsolidationCandidates(facet: string, salienceThreshold: number, limit: number): SelfMemoryRow[] {
+    return this.stmts.findConsolidationCandidates.all(facet, salienceThreshold, limit) as SelfMemoryRow[];
+  }
+
+  public getHealthStats(): {
+    total: number;
+    active: number;
+    pinned: number;
+    archived: number;
+    deleted: number;
+    facetsWithMemories: string[];
+    salienceLow: number;
+    salienceMedium: number;
+    salienceHigh: number;
+  } {
+    const row = this.stmts.healthStats.get() as HealthStatsAggregateRow;
+    const facets = this.stmts.listActiveFacets.all() as Array<{ facet: string }>;
+
+    return {
+      total: row.total,
+      active: row.active,
+      pinned: row.pinned,
+      archived: row.archived,
+      deleted: row.deleted,
+      facetsWithMemories: facets.map((item) => item.facet),
+      salienceLow: row.salience_low,
+      salienceMedium: row.salience_medium,
+      salienceHigh: row.salience_high,
+    };
+  }
+
   public findLowestScoringMemory(facet: string): SelfMemoryRow | undefined {
-    return this.stmts.findLowestScoringMemory.get(facet) as SelfMemoryRow | undefined;
+    return this.stmts.findLowestScoringMemory.get(facet, this.salienceDecayMs) as SelfMemoryRow | undefined;
   }
 
   public listByFacet(facet: string): SelfMemoryRow[] {
     return this.db.prepare(
-      `SELECT * FROM self_memory WHERE deleted_at IS NULL AND facet = ? ORDER BY pinned DESC, updated_at DESC`
+      `SELECT * FROM self_memory
+       WHERE deleted_at IS NULL AND archived_at IS NULL AND facet = ?
+       ORDER BY pinned DESC, updated_at DESC`
     ).all(facet) as SelfMemoryRow[];
   }
 }
